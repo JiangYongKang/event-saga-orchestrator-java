@@ -1,5 +1,16 @@
 package com.github.highcumontoa.saga.domain;
 
-/** 步骤定义：名称、正向动作与补偿动作。 */
-public record StepDefinition(String name, StepAction action, StepAction compensation) {
+import java.time.Duration;
+
+/**
+ * 步骤定义：名称、正向动作、补偿动作与执行时间预算。
+ * timeout 为 null 表示不限制执行时长（保持既有行为）。
+ */
+public record StepDefinition(String name, StepAction action, StepAction compensation,
+                             Duration timeout) {
+
+    /** 兼容构造：不设置时间预算。 */
+    public StepDefinition(String name, StepAction action, StepAction compensation) {
+        this(name, action, compensation, null);
+    }
 }

@@ -11,6 +11,7 @@ import com.github.highcumontoa.saga.event.AckReason;
 import com.github.highcumontoa.saga.event.EventAck;
 import com.github.highcumontoa.saga.event.EventType;
 import com.github.highcumontoa.saga.event.SagaEvent;
+import com.github.highcumontoa.saga.store.InMemoryManualInterventionStore;
 import com.github.highcumontoa.saga.store.InMemorySagaStore;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -33,13 +34,15 @@ class SagaOrchestratorTest {
 
     private InMemorySagaStore store;
     private InMemorySagaDefinitionRegistry registry;
+    private InMemoryManualInterventionStore interventionStore;
     private DefaultSagaOrchestrator orchestrator;
 
     @BeforeEach
     void setUp() {
         store = new InMemorySagaStore();
         registry = new InMemorySagaDefinitionRegistry();
-        orchestrator = new DefaultSagaOrchestrator(store, registry);
+        interventionStore = new InMemoryManualInterventionStore();
+        orchestrator = new DefaultSagaOrchestrator(store, registry, interventionStore);
     }
 
     private void registerThreeStepSaga(String name, List<AtomicInteger> actionCounters,

@@ -28,7 +28,7 @@ public class ApiExceptionHandler {
             case NOT_FOUND -> HttpStatus.NOT_FOUND;
             case CONFLICT -> HttpStatus.CONFLICT;
             case TIMEOUT -> HttpStatus.GATEWAY_TIMEOUT;
-            case RETRY_EXHAUSTED, DEAD_LETTER -> HttpStatus.UNPROCESSABLE_ENTITY;
+            case BUSINESS_FAILURE, RETRY_EXHAUSTED, DEAD_LETTER -> HttpStatus.UNPROCESSABLE_ENTITY;
             case INTERNAL -> HttpStatus.INTERNAL_SERVER_ERROR;
         };
         return ResponseEntity.status(status)
