@@ -1,5 +1,7 @@
 package com.github.highcumontoa.saga.domain;
 
+import com.github.highcumontoa.saga.error.ErrorCategory;
+
 import java.util.List;
 import java.util.Map;
 
@@ -13,6 +15,10 @@ public class SagaInstance {
     private final Map<String, Object> data;
     private SagaStatus status;
     private int currentStepIndex;
+    /** 对外可区分的失败类别（超时/重试耗尽等），未失败为 null。 */
+    private ErrorCategory failureCategory;
+    /** 触发失败的步骤名，未失败为 null。 */
+    private String failureStep;
 
     public SagaInstance(String sagaId, String businessKey, String definitionName,
                         List<StepRecord> steps, Map<String, Object> data) {
@@ -34,4 +40,8 @@ public class SagaInstance {
     public void setStatus(SagaStatus status) { this.status = status; }
     public int getCurrentStepIndex() { return currentStepIndex; }
     public void setCurrentStepIndex(int currentStepIndex) { this.currentStepIndex = currentStepIndex; }
+    public ErrorCategory getFailureCategory() { return failureCategory; }
+    public void setFailureCategory(ErrorCategory failureCategory) { this.failureCategory = failureCategory; }
+    public String getFailureStep() { return failureStep; }
+    public void setFailureStep(String failureStep) { this.failureStep = failureStep; }
 }

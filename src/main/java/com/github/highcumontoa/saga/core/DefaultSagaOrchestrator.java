@@ -5,6 +5,7 @@ import com.github.highcumontoa.saga.domain.SagaInstance;
 import com.github.highcumontoa.saga.domain.SagaStatus;
 import com.github.highcumontoa.saga.domain.StepContext;
 import com.github.highcumontoa.saga.domain.StepDefinition;
+import com.github.highcumontoa.saga.domain.StepFailureKind;
 import com.github.highcumontoa.saga.domain.StepRecord;
 import com.github.highcumontoa.saga.domain.StepStatus;
 import com.github.highcumontoa.saga.error.ErrorCategory;
@@ -12,9 +13,14 @@ import com.github.highcumontoa.saga.error.SagaException;
 import com.github.highcumontoa.saga.event.AckReason;
 import com.github.highcumontoa.saga.event.EventAck;
 import com.github.highcumontoa.saga.event.SagaEvent;
+import com.github.highcumontoa.saga.manual.InMemoryManualInterventionStore;
+import com.github.highcumontoa.saga.manual.ManualInterventionEntry;
+import com.github.highcumontoa.saga.manual.ManualInterventionStatus;
+import com.github.highcumontoa.saga.manual.ManualInterventionStore;
 import com.github.highcumontoa.saga.store.SagaStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -22,6 +28,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
 /**
  * 默认编排器实现。
@@ -44,12 +56,27 @@ public class DefaultSagaOrchestrator implements SagaOrchestrator {
 
     private final SagaStore store;
     private final SagaDefinitionRegistry registry;
+    private final ManualInterventionStore manualInterventionStore;
     /** 按业务键/流程 ID 的锁表，将同一流程的操作串行化。 */
     private final Map<String, Object> locks = new ConcurrentHashMap<>();
+    /** 执行带时间预算的步骤动作的线程池（守护线程，不阻止进程退出）。 */
+    private final ExecutorService stepExecutor = Executors.newCachedThreadPool(r -> {
+        Thread t = new Thread(r, "saga-step-worker");
+        t.setDaemon(true);
+        return t;
+    });
 
-    public DefaultSagaOrchestrator(SagaStore store, SagaDefinitionRegistry registry) {
+    @Autowired
+    public DefaultSagaOrchestrator(SagaStore store, SagaDefinitionRegistry registry,
+                                   ManualInterventionStore manualInterventionStore) {
         this.store = store;
         this.registry = registry;
+        this.manualInterventionStore = manualInterventionStore;
+    }
+
+    /** 便于测试的构造：使用独立的进程内人工介入清单。 */
+    public DefaultSagaOrchestrator(SagaStore store, SagaDefinitionRegistry registry) {
+        this(store, registry, new InMemoryManualInterventionStore());
     }
 
     @Override
@@ -133,17 +160,90 @@ public class DefaultSagaOrchestrator implements SagaOrchestrator {
                 .orElseThrow(() -> new SagaException(ErrorCategory.NOT_FOUND, "流程不存在"));
     }
 
+    @Override
+    public List<ManualInterventionEntry> listManualInterventions(String businessKey,
+                                                                 ManualInterventionStatus status) {
+        return manualInterventionStore.query(businessKey, status);
+    }
+
+    @Override
+    public ManualInterventionEntry reprocessManualIntervention(String entryId) {
+        ManualInterventionEntry entry = manualInterventionStore.findById(entryId)
+                .orElseThrow(() -> new SagaException(ErrorCategory.NOT_FOUND, "人工介入条目不存在"));
+        SagaInstance instance = store.findById(entry.getSagaId())
+                .orElseThrow(() -> new SagaException(ErrorCategory.INTERNAL, "流程实例缺失"));
+        synchronized (lockFor("saga:" + instance.getSagaId())) {
+            if (entry.getStatus() == ManualInterventionStatus.RESOLVED) {
+                throw new SagaException(ErrorCategory.CONFLICT, "条目已处理完成，无需重新处理");
+            }
+            if (instance.getStatus() != SagaStatus.MANUAL_INTERVENTION) {
+                throw new SagaException(ErrorCategory.CONFLICT, "流程不在人工介入状态，无法重新处理");
+            }
+            SagaDefinition definition = registry.find(instance.getDefinitionName())
+                    .orElseThrow(() -> new SagaException(ErrorCategory.INTERNAL, "流程定义缺失"));
+            entry.incrementReprocessCount();
+            entry.setUpdatedAt(java.time.Instant.now());
+            log.info("[manual] 重新处理 entryId={} sagaId={} 第 {} 次重投，状态保持 {} 不回退中间态",
+                    entryId, instance.getSagaId(), entry.getReprocessCount(), instance.getStatus());
+
+            // 只补偿仍处于 EXECUTED 的步骤，保持相反顺序；已 COMPENSATED 的步骤跳过不重复补偿
+            for (int i = instance.getCurrentStepIndex() - 1; i >= 0; i--) {
+                StepRecord record = instance.getSteps().get(i);
+                if (record.getStatus() != StepStatus.EXECUTED) {
+                    continue;
+                }
+                StepDefinition stepDef = definition.steps().get(i);
+                if (!compensateStepWithRetry(instance, stepDef, record, MAX_COMPENSATION_ATTEMPTS)) {
+                    // 仍失败：保持 MANUAL_INTERVENTION 终态稳定，不重复建条目，仅更新快照
+                    entry.setCompensationAttempts(record.getCompensationAttempts());
+                    entry.setUpdatedAt(java.time.Instant.now());
+                    log.warn("[manual] 重新处理仍失败 entryId={} 卡住步骤={} 累计补偿尝试={}，保持终态 {}",
+                            entryId, stepDef.name(), record.getCompensationAttempts(),
+                            instance.getStatus());
+                    return entry;
+                }
+            }
+            transition(instance, SagaStatus.COMPENSATED, "人工重新处理后全部补偿完成");
+            entry.setStatus(ManualInterventionStatus.RESOLVED);
+            entry.setUpdatedAt(java.time.Instant.now());
+            log.info("[manual] 重新处理成功 entryId={} sagaId={} 状态={}",
+                    entryId, instance.getSagaId(), instance.getStatus());
+            return entry;
+        }
+    }
+
+    @Override
+    public void removeResolvedManualIntervention(String entryId) {
+        ManualInterventionEntry entry = manualInterventionStore.findById(entryId)
+                .orElseThrow(() -> new SagaException(ErrorCategory.NOT_FOUND, "人工介入条目不存在"));
+        if (entry.getStatus() != ManualInterventionStatus.RESOLVED) {
+            throw new SagaException(ErrorCategory.CONFLICT, "仅允许清理已处理完成的条目");
+        }
+        manualInterventionStore.remove(entryId);
+        log.info("[manual] 清理已处理条目 entryId={} sagaId={}", entryId, entry.getSagaId());
+    }
+
     // ---- 状态机迁移 ----
 
     private EventAck applyStepSucceeded(SagaInstance instance, SagaDefinition definition, int stepIndex) {
         StepDefinition stepDef = definition.steps().get(stepIndex);
         StepRecord record = instance.getSteps().get(stepIndex);
         transition(instance, SagaStatus.RUNNING, "步骤 " + stepDef.name() + " 成功事件被接受");
+        StepContext ctx = new StepContext(instance.getSagaId(), instance.getBusinessKey(),
+                stepDef.name(), instance.getData());
         try {
-            stepDef.action().run(new StepContext(instance.getSagaId(), instance.getBusinessKey(),
-                    stepDef.name(), instance.getData()));
+            runActionWithBudget(stepDef, ctx);
+        } catch (StepTimedOutException e) {
+            // 超时与业务失败可区分：记录失败种类，对外暴露 TIMEOUT 类别，随后按失败走补偿
+            record.setLastFailureKind(StepFailureKind.TIMEOUT);
+            instance.setFailureCategory(ErrorCategory.TIMEOUT);
+            instance.setFailureStep(stepDef.name());
+            log.error("[step] 步骤 {} 执行超过时间预算 {}ms，按失败处理转入补偿",
+                    stepDef.name(), stepDef.timeout().toMillis());
+            return compensate(instance, definition);
         } catch (Exception e) {
             // 正向动作失败：内部细节仅写日志，对外不泄露；按失败处理进入补偿，避免停留在中间态
+            record.setLastFailureKind(StepFailureKind.BUSINESS_FAILURE);
             log.error("[step] 步骤 {} 正向动作失败，转入补偿。原因={}", stepDef.name(), e.toString());
             return compensate(instance, definition);
         }
@@ -155,12 +255,45 @@ public class DefaultSagaOrchestrator implements SagaOrchestrator {
         return new EventAck(true, AckReason.APPLIED, instance.getStatus());
     }
 
+    /** 内部信号：步骤执行超出时间预算。不对外暴露。 */
+    private static final class StepTimedOutException extends Exception {
+    }
+
+    /** 在步骤时间预算内执行正向动作；未设置预算则直接执行。 */
+    private void runActionWithBudget(StepDefinition stepDef, StepContext ctx) throws Exception {
+        if (stepDef.timeout() == null) {
+            stepDef.action().run(ctx);
+            return;
+        }
+        Future<?> future = stepExecutor.submit(() -> {
+            try {
+                stepDef.action().run(ctx);
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+        });
+        try {
+            future.get(stepDef.timeout().toMillis(), TimeUnit.MILLISECONDS);
+        } catch (TimeoutException e) {
+            future.cancel(true);
+            throw new StepTimedOutException();
+        } catch (ExecutionException e) {
+            if (e.getCause() instanceof RuntimeException re && re.getCause() instanceof Exception orig) {
+                throw orig;
+            }
+            throw new RuntimeException(e.getCause());
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new RuntimeException("步骤执行被中断", e);
+        }
+    }
+
     private EventAck applyStepFailed(SagaInstance instance, SagaDefinition definition, int stepIndex) {
         log.info("[step] 步骤 {} 失败事件被接受，开始补偿", definition.steps().get(stepIndex).name());
         return compensate(instance, definition);
     }
 
-    /** 按与执行相反的顺序补偿已完成步骤；重试耗尽进入人工介入终态。 */
+    /** 按与执行相反的顺序补偿已完成步骤；重试耗尽进入人工介入终态并登记清单。 */
     private EventAck compensate(SagaInstance instance, SagaDefinition definition) {
         transition(instance, SagaStatus.COMPENSATING, "触发补偿，按相反顺序回滚");
         for (int i = instance.getCurrentStepIndex() - 1; i >= 0; i--) {
@@ -169,10 +302,13 @@ public class DefaultSagaOrchestrator implements SagaOrchestrator {
                 continue;
             }
             StepDefinition stepDef = definition.steps().get(i);
-            if (!compensateStepWithRetry(instance, stepDef, record)) {
+            if (!compensateStepWithRetry(instance, stepDef, record, MAX_COMPENSATION_ATTEMPTS)) {
+                instance.setFailureCategory(ErrorCategory.RETRY_EXHAUSTED);
+                instance.setFailureStep(stepDef.name());
                 transition(instance, SagaStatus.MANUAL_INTERVENTION,
                         "步骤 " + stepDef.name() + " 补偿重试 " + MAX_COMPENSATION_ATTEMPTS
                                 + " 次仍失败（RETRY_EXHAUSTED），进入人工介入终态");
+                registerManualIntervention(instance, stepDef, record);
                 return new EventAck(true, AckReason.APPLIED, instance.getStatus());
             }
         }
@@ -180,8 +316,35 @@ public class DefaultSagaOrchestrator implements SagaOrchestrator {
         return new EventAck(true, AckReason.APPLIED, instance.getStatus());
     }
 
-    private boolean compensateStepWithRetry(SagaInstance instance, StepDefinition stepDef, StepRecord record) {
-        while (record.getCompensationAttempts() < MAX_COMPENSATION_ATTEMPTS) {
+    /** 登记人工介入清单：同一流程只保留一条，重复进入仅更新快照，不叠加记录。 */
+    private void registerManualIntervention(SagaInstance instance, StepDefinition stepDef, StepRecord record) {
+        var existing = manualInterventionStore.findBySagaId(instance.getSagaId());
+        if (existing.isPresent()) {
+            ManualInterventionEntry entry = existing.get();
+            entry.setCompensationAttempts(record.getCompensationAttempts());
+            entry.setUpdatedAt(java.time.Instant.now());
+            log.info("[manual] 流程 {} 已在人工介入清单中（entryId={}），仅更新快照",
+                    instance.getSagaId(), entry.getEntryId());
+            return;
+        }
+        ManualInterventionEntry entry = new ManualInterventionEntry(
+                UUID.randomUUID().toString(), instance.getSagaId(), instance.getBusinessKey(),
+                instance.getDefinitionName(), stepDef.name(), ErrorCategory.RETRY_EXHAUSTED,
+                "步骤 " + stepDef.name() + " 补偿重试 " + MAX_COMPENSATION_ATTEMPTS + " 次仍失败",
+                record.getCompensationAttempts(), java.time.Instant.now());
+        manualInterventionStore.upsert(entry);
+        log.info("[manual] 登记人工介入 entryId={} sagaId={} 卡住步骤={} 已补偿尝试={}",
+                entry.getEntryId(), instance.getSagaId(), stepDef.name(),
+                record.getCompensationAttempts());
+    }
+
+    /**
+     * 在预算内重试补偿单个步骤；budget 为本次调用允许的最大尝试次数，
+     * 尝试次数在步骤记录上累计（跨重投可见）。
+     */
+    private boolean compensateStepWithRetry(SagaInstance instance, StepDefinition stepDef,
+                                            StepRecord record, int budget) {
+        for (int attempt = 0; attempt < budget; attempt++) {
             record.incrementCompensationAttempts();
             try {
                 stepDef.compensation().run(new StepContext(instance.getSagaId(),

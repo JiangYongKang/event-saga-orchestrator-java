@@ -56,7 +56,7 @@ curl http://localhost:$PORT/api/sagas/{sagaId}
 
 ```
 NEW --STEP_SUCCEEDED--> RUNNING --全部步骤完成--> COMPLETED（终态）
-NEW/RUNNING --STEP_FAILED 或正向动作异常--> COMPENSATING
+NEW/RUNNING --STEP_FAILED、正向动作异常或步骤超时--> COMPENSATING
 COMPENSATING --全部补偿成功--> COMPENSATED（终态）
 COMPENSATING --补偿重试耗尽--> MANUAL_INTERVENTION（终态，人工介入）
 ```
@@ -86,6 +86,51 @@ COMPENSATING --补偿重试耗尽--> MANUAL_INTERVENTION（终态，人工介入
   内部异常细节（堆栈、原因）只写日志，不泄露给调用方。REST 层由
   `ApiExceptionHandler` 统一映射为 `{category, message}`。
 
+## 步骤超时
+
+`StepDefinition` 可携带时间预算（`Duration timeout`，不设置表示不限制）：
+
+```java
+new StepDefinition("charge-payment", action, compensation, Duration.ofMillis(500))
+```
+
+- 正向动作在预算内未完成即判为**超时失败**：中断执行、按失败处理并正常走反向补偿，
+  流程不会悬在中间态。
+- 超时与普通业务失败**对外可区分**：
+  - 流程视图新增 `failureCategory` / `failureStep` 字段，超时时 `failureCategory=TIMEOUT`；
+  - 步骤视图新增 `lastFailureKind`（`TIMEOUT` / `BUSINESS_FAILURE`）。
+- 补偿重试耗尽进入人工介入时，`failureCategory=RETRY_EXHAUSTED`。
+- 内部异常与堆栈只写日志，不会通过接口透出。
+
+## 人工介入清单
+
+补偿重试耗尽后流程进入 `MANUAL_INTERVENTION` 终态，同时登记一条人工介入清单记录
+（同一流程只保留一条，重复进入仅更新快照，不叠加记录）。条目包含：卡住的步骤
+（`stuckStepName`）、失败类别与原因、累计补偿尝试次数、重投次数与处理状态
+（`PENDING` / `RESOLVED`）。
+
+```bash
+# 查询清单（可按 businessKey / status 过滤，参数均可省略）
+curl "http://localhost:$PORT/api/sagas/manual-interventions?businessKey=order-1001&status=PENDING"
+
+# 运营确认后重新处理：从卡住位置继续按相反顺序补偿
+curl -X POST http://localhost:$PORT/api/sagas/manual-interventions/{entryId}/reprocess
+
+# 清理已处理完成的条目（PENDING 条目拒绝清理，返回 409 CONFLICT）
+curl -X DELETE http://localhost:$PORT/api/sagas/manual-interventions/{entryId}
+```
+
+重新处理规则：
+
+- **不重复补偿**：已成功回滚（`COMPENSATED`）的步骤跳过，只补做仍处于 `EXECUTED`
+  的步骤，且严格保持与执行相反的顺序。
+- **终态稳定**：重投期间状态保持 `MANUAL_INTERVENTION`，不回退中间态；重投成功则
+  迁移到 `COMPENSATED` 并将条目置为 `RESOLVED`；仍失败则保持 `MANUAL_INTERVENTION`，
+  仅更新原条目的尝试次数与重投次数，不新增记录。
+- 每次重投追加一轮重试预算（`MAX_COMPENSATION_ATTEMPTS = 3` 次），
+  累计尝试次数在条目与步骤记录中可见。
+- 已 `RESOLVED` 的条目再次重投返回 `409 CONFLICT`。
+
 ## 本地验证
 
 ```bash
@@ -105,15 +150,26 @@ mvn test
 | `compensationExhaustionLeadsToManualInterventionTerminalState` | 补偿持续失败 → `MANUAL_INTERVENTION`，尝试次数=3，终态事件被忽略 |
 | `concurrentCreateWithSameBusinessKeyReturnsSameSaga` | 并发创建同一业务键收敛到同一实例 |
 
+新增场景（`SagaTimeoutAndManualInterventionTest`，日志中带 `[test-scenario]` 标记）：
+
+| 用例 | 断言 |
+| --- | --- |
+| `stepTimeoutTriggersCompensationAndIsDistinguishable` | 步骤超时 → 反向补偿至 `COMPENSATED`，`failureCategory=TIMEOUT`、`lastFailureKind=TIMEOUT` |
+| `businessFailureIsDistinguishedFromTimeout` | 业务失败标记 `BUSINESS_FAILURE`，不误标 `TIMEOUT` |
+| `manualInterventionListIsQueryableByBusinessKeyAndStatus` | 清单可按业务键/状态查询，可见卡住步骤、失败类别与补偿次数 |
+| `reprocessDoesNotRecompensateAlreadyCompensatedSteps` | 重投不重复补偿已回滚步骤，成功后 `RESOLVED` 且可清理，重复重投返回 `CONFLICT` |
+| `failedReprocessKeepsTerminalStateStable` | 重投仍失败保持 `MANUAL_INTERVENTION`，不叠加记录、不可清理 |
+
 ## 工程结构
 
 ```
 src/main/java/com/github/highcumontoa/saga/
-├── domain/    # 状态枚举、流程/步骤定义与实例
+├── domain/    # 状态枚举、流程/步骤定义与实例（含步骤时间预算与失败种类）
 ├── event/     # 事件契约、回执与可区分原因
 ├── error/     # 归一化错误类别与异常
 ├── store/     # 进程内实例存储 + 已处理事件表
-├── core/      # 编排器（状态机、串行化、补偿与重试）
+├── manual/    # 人工介入清单（条目、状态与进程内存储）
+├── core/      # 编排器（状态机、串行化、超时、补偿与重试、重投）
 ├── api/       # REST 入口与统一错误出口
 └── demo/      # 示例流程定义 order-fulfillment
 ```
